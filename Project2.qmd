@@ -1,0 +1,873 @@
+---
+title: "Project 2"
+format: html
+editor: visual
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+## Reproducibility
+
+This analysis requires the following R packages:
+data.table, dplyr, survival, survminer, cowplot.
+
+If needed, install them via:
+install.packages(c("dplyr", "data.table", "survival", "survminer", "cowplot"))
+
+```{r}
+library(data.table)
+library(dplyr)
+library(survival)
+library(survminer)
+library(cowplot)
+set.seed(629)
+```
+
+
+```{r}
+MSK_CHORD_url <- "https://media.githubusercontent.com/media/cBioPortal/datahub/refs/heads/master/public/msk_chord_2024/"
+```
+
+```{r}
+read_msk <- function(filename){
+  read.delim(
+    paste0(MSK_CHORD_url, filename),
+    comment.char = "#",
+    stringsAsFactors = TRUE
+  )
+}
+```
+
+```{r}
+# Clinical and genomics files
+clinical_patient <- read_msk("data_clinical_patient.txt")
+clinical_sample <- read_msk("data_clinical_sample.txt")
+CNA <- read_msk("data_cna.txt")
+
+#timeline files
+diagnosis <- read_msk("data_timeline_diagnosis.txt")
+treatment <- read_msk("data_timeline_treatment.txt")
+#progression <- read_msk("data_timeline_progression.txt")
+tumor_site <- read_msk("data_timeline_tumor_sites.txt")
+```
+
+
+```{r}
+# Data Preprocessing
+clinical_patient_filtered <- clinical_patient |>
+  select(
+    PATIENT_ID,
+    OS_MONTHS,
+    OS_STATUS,
+    CURRENT_AGE_DEID,
+    GENDER,
+    STAGE_HIGHEST_RECORDED
+  ) |>
+  mutate(
+    PATIENT_ID = as.character(PATIENT_ID),
+    GENDER = as.character(GENDER),
+    STAGE_HIGHEST_RECORDED = as.character(STAGE_HIGHEST_RECORDED),
+    OS_EVENT = as.integer(OS_STATUS == "1:DECEASED")
+  ) |>
+  filter(GENDER != "Unknown")
+
+clinical_sample_filtered <- clinical_sample |>
+  select(
+    SAMPLE_ID,
+    PATIENT_ID,
+    CANCER_TYPE,
+    SAMPLE_TYPE
+  ) |>
+  mutate(
+    SAMPLE_ID = as.character(SAMPLE_ID),
+    PATIENT_ID = as.character(PATIENT_ID),
+    CANCER_TYPE = as.character(CANCER_TYPE),
+    SAMPLE_TYPE = as.character(SAMPLE_TYPE)
+  )
+
+# We use the sample with sample type Primary for each patient, if no, local recurrence, then metastasis
+colnames(CNA)[-1] <- gsub("\\.", "-", colnames(CNA)[-1])
+
+clinical_sample_one <- clinical_sample_filtered |>
+  mutate(priority = case_when(
+    SAMPLE_TYPE == "Primary" ~ 1,
+    SAMPLE_TYPE == "Local Recurrence" ~ 2,
+    SAMPLE_TYPE == "Metastasis" ~ 3,
+    TRUE ~ 4
+  )) |>
+  arrange(PATIENT_ID, priority) |>
+  group_by(PATIENT_ID) |>
+  slice(1) |>
+  ungroup() |>
+  filter(SAMPLE_ID %in% colnames(CNA)) |> #6 samples removed
+  mutate(CANCER_TYPE = as.character(CANCER_TYPE))
+
+CNA_selected <- CNA[,c("Hugo_Symbol", clinical_sample_one$SAMPLE_ID), drop = FALSE]
+
+diagnosis_summary <- diagnosis |>
+  mutate(PATIENT_ID = as.character(PATIENT_ID)) |>
+  group_by(PATIENT_ID) |>
+  summarise(
+    DIAGNOSIS_DATE = min(START_DATE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#progression_td <- progression |>
+#  select(
+#    PATIENT_ID,
+#    START_DATE,
+#    PROGRESSION
+#  ) |>
+#  filter(PROGRESSION == "Y") |>
+#  left_join(diagnosis_summary, by = "PATIENT_ID") |> 
+#  mutate(
+#    time = (START_DATE - DIAGNOSIS_DATE) / 30.44
+#  ) |>
+#  filter(!is.na(time), time >= 0) |>
+#  group_by(PATIENT_ID) |>
+#  summarise(
+#    time = min(time),
+#    .groups = "drop"
+#  )
+
+treatment_td <- treatment |>
+  select(
+    PATIENT_ID,
+    START_DATE,
+    SUBTYPE
+  ) |>
+  mutate(
+    PATIENT_ID = as.character(PATIENT_ID),
+    SUBTYPE = as.character(SUBTYPE),
+    TYPE = case_when(
+      SUBTYPE == "Chemo" ~ "CHEMO",
+      SUBTYPE == "Hormone" ~ "HORMONE",
+      SUBTYPE == "Targeted" ~ "TARGETED",
+      SUBTYPE == "Biologic" ~ "BIOLOGIC",
+      TRUE ~ "ALL_OTHER"
+    ),
+    CHEMO = as.integer(TYPE == "CHEMO"),
+    HORMONE = as.integer(TYPE == "HORMONE"),
+    TARGETED = as.integer(TYPE == "TARGETED"),
+    BIOLOGIC = as.integer(TYPE == "BIOLOGIC"),
+    ALL_OTHER = as.integer(TYPE == "ALL_OTHER")
+  ) |>
+  group_by(PATIENT_ID, START_DATE) |>
+  summarise(
+    CHEMO = max(CHEMO),
+    HORMONE = max(HORMONE),
+    TARGETED = max(TARGETED),
+    BIOLOGIC = max(BIOLOGIC),
+    ALL_OTHER = max(ALL_OTHER),
+    .groups = "drop"
+  ) |>
+  arrange(PATIENT_ID, START_DATE) |>
+  group_by(PATIENT_ID) |>
+  mutate(
+    CHEMO = cummax(CHEMO),
+    HORMONE = cummax(HORMONE),
+    TARGETED = cummax(TARGETED),
+    BIOLOGIC = cummax(BIOLOGIC),
+    ALL_OTHER = cummax(ALL_OTHER)
+  ) |>
+  ungroup()
+  
+tumor_site_summary <- tumor_site |>
+  group_by(PATIENT_ID) |>
+  mutate(PATIENT_ID = as.character(PATIENT_ID)) |>
+  summarise(
+    Number_Tumor_Sites = n_distinct(TUMOR_SITE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# Static patient level dataset
+Analysis_static <- clinical_patient_filtered |>
+  left_join(clinical_sample_one, by = "PATIENT_ID") |>
+  left_join(diagnosis_summary, by = "PATIENT_ID") |>
+  left_join(tumor_site_summary, by = "PATIENT_ID") |>
+  mutate(
+    Number_Tumor_Sites = ifelse(is.na(Number_Tumor_Sites), 0, Number_Tumor_Sites)
+  ) |>
+  filter(!is.na(CURRENT_AGE_DEID))
+```
+
+
+```{r}
+# Gene level CNA information
+valid_samples <- as.character(clinical_sample_one$SAMPLE_ID)
+CNA_matrix <- as.matrix(CNA_selected[ , valid_samples, drop = FALSE])
+colnames(CNA_matrix) <- valid_samples
+rownames(CNA_matrix) <- as.character(CNA_selected$Hugo_Symbol)
+X_CNA <- t(CNA_matrix)
+X_CNA_binary <- (X_CNA != 0) * 1
+X_CNA_binary[is.na(X_CNA_binary)] <- 0
+# For model stability, we use binary(altered, not altered)
+gene_frequency <- colMeans(X_CNA_binary, na.rm = TRUE)
+top_10_genes_idx <- order(gene_frequency, decreasing = TRUE)[1:10]
+top_10_genes <- colnames(X_CNA_binary)[top_10_genes_idx]
+X_CNA_top <- X_CNA_binary[, top_10_genes, drop = FALSE]
+
+CNA_df <- data.frame(
+  X_CNA_top,
+  check.names = FALSE
+)
+CNA_df <- cbind(SAMPLE_ID = valid_samples, CNA_df)
+CNA_df$SAMPLE_ID <- as.character(CNA_df$SAMPLE_ID)
+colnames(CNA_df)[-1] <- make.names(colnames(CNA_df)[-1])
+
+top_10_genes <- make.names(top_10_genes)
+
+CNA_patient <- clinical_sample_one |>
+  mutate(PATIENT_ID = as.character(PATIENT_ID),
+         SAMPLE_ID = as.character(SAMPLE_ID)) |>
+  select(PATIENT_ID, SAMPLE_ID) |>
+  left_join(CNA_df, by = "SAMPLE_ID")
+
+Analysis_static <- Analysis_static |>
+  left_join(
+    CNA_patient |> select(-SAMPLE_ID),
+    by = "PATIENT_ID"
+  ) |>
+  mutate(across(all_of(top_10_genes), ~ ifelse(is.na(.), 0, .)))
+```
+
+
+
+```{r}
+# Treatment, time dependent variable
+treatment_time_depend <- treatment_td |>
+  left_join(diagnosis_summary, by = "PATIENT_ID") |>
+  left_join(Analysis_static %>% select(PATIENT_ID, OS_MONTHS), by = "PATIENT_ID") |>
+  mutate(
+    time = (START_DATE - DIAGNOSIS_DATE) / 30.44
+  ) |>
+  filter(!is.na(time), time >= 0, time <= OS_MONTHS) |> # Use Diagnosis date as the baseline time
+  select(PATIENT_ID, time, CHEMO, HORMONE, TARGETED, BIOLOGIC, ALL_OTHER)
+
+base_dataset <- Analysis_static |>
+  mutate(PATIENT_ID = as.character(PATIENT_ID)) |>
+  select(PATIENT_ID, OS_MONTHS, OS_EVENT)
+
+time_depend_data <- tmerge(
+  data1 = base_dataset,
+  data2 = base_dataset,
+  id = PATIENT_ID,
+  death = event(OS_MONTHS, OS_EVENT)
+)
+
+time_depend_data <- tmerge(
+  time_depend_data,
+  treatment_time_depend,
+  id = PATIENT_ID,
+  CHEMO = tdc(time, CHEMO, init = 0),
+  HORMONE = tdc(time, HORMONE, init = 0),
+  BIOLOGIC = tdc(time, BIOLOGIC, init = 0),
+  TARGETED = tdc(time, TARGETED, init = 0),
+  ALL_OTHER = tdc(time, ALL_OTHER, init = 0)
+)
+
+#time_depend_data <- tmerge(
+#  time_depend_data,
+#  progression_td,
+#  id = PATIENT_ID,
+#  PROGRESSION = tdc(time, 1, init = 0)
+#)
+
+time_depend_data <- time_depend_data |>
+  left_join(
+    Analysis_static |> select(-OS_MONTHS, -OS_EVENT),
+    by = "PATIENT_ID"
+  )
+```
+
+
+
+```{r}
+# base model(only clinical)
+cox_base <- coxph(Surv(tstart, tstop, death) ~ CURRENT_AGE_DEID + GENDER + 
+                  STAGE_HIGHEST_RECORDED + Number_Tumor_Sites +strata(CANCER_TYPE), 
+                  data = time_depend_data,
+                  cluster = PATIENT_ID)
+#summary(cox_base)
+```
+
+
+```{r}
+# Static cox model
+cox_treat <- coxph(
+      Surv(tstart, tstop, death) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED + Number_Tumor_Sites + CHEMO + HORMONE
+      + TARGETED + BIOLOGIC + ALL_OTHER + strata(CANCER_TYPE),
+      data = time_depend_data, cluster = PATIENT_ID
+)
+
+#summary(cox_treat)
+```
+
+```{r}
+# Time dependent model
+cox_gene <- coxph(
+  as.formula(
+    paste(
+      "Surv(tstart, tstop, death) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED + Number_Tumor_Sites +",
+      "CHEMO + HORMONE + TARGETED + BIOLOGIC + ALL_OTHER +",
+      paste(top_10_genes, collapse = " + "),
+      "+ strata(CANCER_TYPE)"
+    )
+  ),
+  data = time_depend_data,
+  cluster = PATIENT_ID
+)
+```
+
+```{r}
+#summary(cox_base)$concordance
+#summary(cox_treat)$concordance
+#summary(cox_gene)$concordance
+```
+
+```{r}
+#AIC(cox_base, cox_treat, cox_gene)
+#BIC(cox_base, cox_treat, cox_gene)
+```
+
+```{r}
+#| label: model-performance-table
+
+aic_tab <- AIC(cox_base, cox_treat, cox_gene)
+bic_tab <- BIC(cox_base, cox_treat, cox_gene)
+
+c_base  <- summary(cox_base)$concordance
+c_treat <- summary(cox_treat)$concordance
+c_gene  <- summary(cox_gene)$concordance
+
+model_perf <- data.frame(
+  Model = c("Base", "Treatment", "CNA"),
+  df = aic_tab$df,
+  C_index = round(c(c_base[1], c_treat[1], c_gene[1]), 3),
+  SE = round(c(c_base[2], c_treat[2], c_gene[2]), 4),
+  AIC = round(aic_tab$AIC, 1),
+  Delta_AIC = round(aic_tab$AIC[1] - aic_tab$AIC, 1),
+  BIC = round(bic_tab$BIC, 1),
+  Delta_BIC = round(bic_tab$BIC[1] - bic_tab$BIC, 1)
+)
+
+knitr::kable(model_perf, caption = "Comparison of model performance across Cox models")
+```
+
+
+```{r}
+# Static mode for KM curve and risk stratification: age + gender + stage + CNA + number of tumor sites
+cox_km_gene_sites <- coxph(
+  as.formula(
+    paste(
+      "Surv(OS_MONTHS, OS_EVENT) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED + Number_Tumor_Sites +",
+      paste(top_10_genes, collapse = " + ")
+    )
+  ),
+  data = Analysis_static
+)
+```
+
+```{r}
+Analysis_static_gene_sites <- Analysis_static |>
+  mutate(risk_score_gene_sites = predict(cox_km_gene_sites, type = "lp"))
+
+risk_cutoff_gene_sites <- median(Analysis_static_gene_sites$risk_score_gene_sites, na.rm = TRUE)
+Analysis_static_gene_sites <- Analysis_static_gene_sites |>
+  mutate(risk_group_gene_sites = ifelse(risk_score_gene_sites > risk_cutoff_gene_sites, "High risk", "Low risk"))
+```
+
+```{r}
+if(!dir.exists("./Figures")) dir.create("./Figures")
+```
+
+```{r}
+#| label: KM_Curve_of_gene_model_with_tumor_sites
+# Kaplan-Meier Curve
+km_fit_gene_sites <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ risk_group_gene_sites, data = Analysis_static_gene_sites)
+
+p1 <- ggsurvplot(
+  km_fit_gene_sites,
+  data = Analysis_static_gene_sites,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  legend.title = "Risk group",
+  legend.labs = c("High risk", "Low risk"),
+  xlab = "Time (months)",
+  ylab = "Survival probability",
+  title = "Kaplan-Meier curves by CNA-based risk stratification (adjusted for tumor sites)",
+  facet.by = "CANCER_TYPE"
+) + theme(plot.title = element_text(size = 25))
+
+ggsave("./Figures/KM_gene_sites.png", plot = p1, width = 14, height = 10, dpi = 300)
+```
+
+```{r}
+#| label: log-rank-gene-sites-table
+# Log-rank test
+#survdiff(Surv(OS_MONTHS, OS_EVENT) ~ risk_group_gene_sites, data = Analysis_static_gene_sites)
+lr_gene_sites <- survdiff(
+  Surv(OS_MONTHS, OS_EVENT) ~ risk_group_gene_sites,
+  data = Analysis_static_gene_sites
+)
+
+logrank_table <- data.frame(
+  Group = names(lr_gene_sites$n),
+  N = as.numeric(lr_gene_sites$n),
+  Observed = as.numeric(lr_gene_sites$obs),
+  Expected = round(as.numeric(lr_gene_sites$exp), 0),
+  OE2_E = round((lr_gene_sites$obs - lr_gene_sites$exp)^2 / lr_gene_sites$exp, 0)
+)
+
+knitr::kable(
+  logrank_table,
+  caption = paste0(
+    "Log-rank test for gene-based risk groups adjusted for tumor sites. Chi-square = ",
+    round(lr_gene_sites$chisq, 1),
+    ", p < 2e-16."
+  )
+)
+```
+
+```{r}
+# Static mode for KM curve and risk stratification: age + gender + stage + CNA
+cox_km_gene_nosites <- coxph(
+  as.formula(
+    paste(
+      "Surv(OS_MONTHS, OS_EVENT) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED +",
+      paste(top_10_genes, collapse = " + ")
+    )
+  ),
+  data = Analysis_static
+)
+```
+
+```{r}
+Analysis_static_gene_nosites <- Analysis_static |>
+  mutate(risk_score_gene_nosites = predict(cox_km_gene_nosites, type = "lp"))
+
+risk_cutoff_gene_nosites <- median(Analysis_static_gene_nosites$risk_score_gene_nosites, na.rm = TRUE)
+Analysis_static_gene_nosites <- Analysis_static_gene_nosites |>
+  mutate(risk_group_gene_nosites = ifelse(risk_score_gene_nosites > risk_cutoff_gene_nosites, "High risk", "Low risk"))
+```
+
+```{r}
+#| label: KM_Curve_of_gene_model_without_tumor_sites
+# Kaplan-Meier Curve
+km_fit_gene_nosites <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ risk_group_gene_nosites, data = Analysis_static_gene_nosites)
+
+p2 <- ggsurvplot(
+  km_fit_gene_nosites,
+  data = Analysis_static_gene_nosites,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  legend.title = "Risk group",
+  legend.labs = c("High risk", "Low risk"),
+  xlab = "Time (months)",
+  ylab = "Survival probability",
+  title = "Kaplan-Meier curves by CNA-based risk stratification (without tumor sites)",
+  facet.by = "CANCER_TYPE"
+) + theme(plot.title = element_text(size = 25))
+
+ggsave("./Figures/KM_gene_nosites.png", plot = p2, width = 14, height = 10, dpi = 300)
+```
+
+
+```{r}
+# cox km base: no CNA
+cox_km_base_sites <- coxph(
+    Surv(OS_MONTHS, OS_EVENT) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED + Number_Tumor_Sites,
+    data = Analysis_static
+)
+```
+
+```{r}
+Analysis_static_base_sites <- Analysis_static |>
+  mutate(risk_score_base_sites = predict(cox_km_base_sites, type = "lp"))
+
+risk_cutoff_base_sites <- median(Analysis_static_base_sites$risk_score_base_sites, na.rm = TRUE)
+Analysis_static_base_sites <- Analysis_static_base_sites |>
+  mutate(risk_group_base_sites = ifelse(risk_score_base_sites > risk_cutoff_base_sites, "High risk", "Low risk"))
+```
+
+```{r}
+#| label: KM_Curve_of_base_model_with_tumor_sites
+# Kaplan-Meier Curve
+km_fit_base_sites <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ risk_group_base_sites, data = Analysis_static_base_sites)
+
+p3 <- ggsurvplot(
+  km_fit_base_sites,
+  data = Analysis_static_base_sites,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  legend.title = "Risk group",
+  legend.labs = c("High risk", "Low risk"),
+  xlab = "Time (months)",
+  ylab = "Survival probability",
+  title = "Kaplan-Meier curves by base risk stratification (adjusted for tumor sites)",
+  facet.by = "CANCER_TYPE"
+) + theme(plot.title = element_text(size = 25))
+
+ggsave("./Figures/KM_base_sites.png", plot = p3, width = 14, height = 10, dpi = 300)
+```
+
+```{r}
+#| label: log-rank-base-sites-table
+# Log-rank test
+#survdiff(Surv(OS_MONTHS, OS_EVENT) ~ risk_group_base_sites, data = Analysis_static_base_sites)
+lr_base_sites <- survdiff(
+  Surv(OS_MONTHS, OS_EVENT) ~ risk_group_base_sites,
+  data = Analysis_static_base_sites
+)
+
+logrank_base_table <- data.frame(
+  Group = names(lr_base_sites$n),
+  N = as.numeric(lr_base_sites$n),
+  Observed = as.numeric(lr_base_sites$obs),
+  Expected = round(as.numeric(lr_base_sites$exp), 0),
+  OE2_E = round((lr_base_sites$obs - lr_base_sites$exp)^2 / lr_base_sites$exp, 0)
+)
+
+knitr::kable(
+  logrank_base_table,
+  caption = paste0(
+    "Log-rank test for base model risk groups adjusted for tumor sites. Chi-square = ",
+    round(lr_base_sites$chisq, 1),
+    ", p < 2e-16."
+  )
+)
+```
+
+```{r}
+# cox km base: no CNA
+cox_km_base_nosites <- coxph(
+    Surv(OS_MONTHS, OS_EVENT) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED,
+    data = Analysis_static
+)
+```
+
+```{r}
+Analysis_static_base_nosites <- Analysis_static |>
+  mutate(risk_score_base_nosites = predict(cox_km_base_nosites, type = "lp"))
+
+risk_cutoff_base_nosites <- median(Analysis_static_base_nosites$risk_score_base_nosites, na.rm = TRUE)
+Analysis_static_base_nosites <- Analysis_static_base_nosites |>
+  mutate(risk_group_base_nosites = ifelse(risk_score_base_nosites > risk_cutoff_base_nosites, "High risk", "Low risk"))
+```
+
+```{r}
+#| label: KM_Curve_of_base_model_without_tumor_sites
+# Kaplan-Meier Curve
+km_fit_base_nosites <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ risk_group_base_nosites, data = Analysis_static_base_nosites)
+
+p4 <- ggsurvplot(
+  km_fit_base_nosites,
+  data = Analysis_static_base_nosites,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  legend.title = "Risk group",
+  legend.labs = c("High risk", "Low risk"),
+  xlab = "Time (months)",
+  ylab = "Survival probability",
+  title = "Kaplan-Meier curves by base risk stratification (without tumor sites)",
+  facet.by = "CANCER_TYPE"
+) + theme(plot.title = element_text(size = 25))
+
+ggsave("./Figures/KM_base_nosites.png", plot = p4, width = 14, height = 10, dpi = 300)
+```
+
+
+
+```{r}
+combined_sites <- plot_grid(
+  p1,
+  p3,
+  ncol = 1,
+  #labels = c("CNA model", "Base model"),
+  #label_x = 0.02,
+  #label_y = 0.95,
+  align = "v"
+) + theme(legend.position = "bottom")
+
+ggsave("./Figures/KM_with_tumor_sites.png", combined_sites, width = 14, height = 10, dpi = 300)
+```
+
+```{r}
+#| label: Risk-stratification-with-tumor-sites
+#| fig.width: 14
+#| fig.height: 10
+print(combined_sites)
+```
+
+
+```{r}
+combined_nosites <- plot_grid(
+  p2, 
+  p4,
+  ncol = 1,
+  #labels = c("CNA model", "Base model"),
+  #label_x = 0.02,
+  #label_y = 0.95,
+  align = "v"
+)
+
+ggsave("./Figures/KM_without_tumor_sites.png", combined_nosites, width = 14, height = 10, dpi = 300)
+```
+
+```{r}
+#| label: Risk-stratification-without-tumor-sites
+#| fig.width: 14
+#| fig.height: 10
+print(combined_nosites)
+```
+
+
+```{r}
+CNA_df_full <- data.frame(
+  X_CNA_binary, 
+  check.names = FALSE
+)
+CNA_df_full <- cbind(SAMPLE_ID = valid_samples, CNA_df_full)
+CNA_df_full$SAMPLE_ID <- as.character(CNA_df_full$SAMPLE_ID)
+colnames(CNA_df_full)[-1] <- make.names(colnames(CNA_df_full)[-1])
+
+CNA_patient_full <- clinical_sample_one |>
+  mutate(PATIENT_ID = as.character(PATIENT_ID),
+         SAMPLE_ID = as.character(SAMPLE_ID)) |>
+  select(PATIENT_ID, SAMPLE_ID) |>
+  left_join(CNA_df_full, by = "SAMPLE_ID")
+
+Analysis_static_full <- clinical_patient_filtered |>
+  left_join(clinical_sample_one, by = "PATIENT_ID") |>
+  left_join(diagnosis_summary, by = "PATIENT_ID") |>
+  left_join(tumor_site_summary, by = "PATIENT_ID") |>
+  mutate(
+    Number_Tumor_Sites = ifelse(is.na(Number_Tumor_Sites), 0, Number_Tumor_Sites)
+  ) |>
+  filter(!is.na(CURRENT_AGE_DEID))
+
+Analysis_static_full <- Analysis_static_full |>
+  left_join(
+    CNA_patient_full |> select(-SAMPLE_ID),
+    by = "PATIENT_ID"
+  )
+
+full_gene_vars <- setdiff(colnames(CNA_patient_full), c("PATIENT_ID", "SAMPLE_ID"))
+
+Analysis_static_full <- Analysis_static_full |>
+  mutate(across(all_of(full_gene_vars), ~ ifelse(is.na(.), 0, .))) |>
+  filter(!is.na(CANCER_TYPE))
+```
+
+
+```{r}
+clinical_vars <- c("PATIENT_ID", "SAMPLE_ID", "OS_MONTHS", "OS_EVENT", 
+                   "CURRENT_AGE_DEID", "GENDER", "STAGE_HIGHEST_RECORDED", 
+                   "Number_Tumor_Sites", "CANCER_TYPE", "priority", 
+                   "DIAGNOSIS_DATE", "OS_STATUS", "SAMPLE_TYPE")
+
+cancer_types <- unique(Analysis_static_full$CANCER_TYPE)
+
+km_by_cancer <- list()
+
+for (cancer in cancer_types) {
+  sub_data <- Analysis_static_full |>
+    filter(CANCER_TYPE == cancer) |>
+    filter(!is.na(OS_MONTHS), OS_MONTHS > 0, !is.na(OS_EVENT))
+  
+  gene_cols <- setdiff(colnames(sub_data), clinical_vars)
+  gene_cols <- gene_cols[gene_cols != ""]
+  
+  gene_freq <- sapply(sub_data[gene_cols], function(x) mean(x == 1, na.rm = TRUE))
+  
+  gene_freq <- gene_freq[gene_freq > 0]
+  
+  n_genes <- min(10, length(gene_freq))
+  top_genes <- names(sort(gene_freq, decreasing = TRUE))[1:n_genes]
+  
+  top_genes <- intersect(top_genes, colnames(sub_data))
+  
+  #cat("  Top genes:", paste(top_genes, collapse = ", "), "\n")
+  
+  cox_fit <- coxph(
+    as.formula(
+      paste(
+        "Surv(OS_MONTHS, OS_EVENT) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED + Number_Tumor_Sites +",
+        paste(top_genes, collapse = " + ")
+      )
+    ),
+    data = sub_data
+  )
+  
+  sub_data$risk_score <- predict(cox_fit, type = "lp")
+  cutoff <- median(sub_data$risk_score, na.rm = TRUE)
+  sub_data$risk_group <- factor(
+    ifelse(sub_data$risk_score > cutoff, "High risk", "Low risk"),
+    levels = c("Low risk", "High risk")
+  )
+  
+  km_fit <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ risk_group, data = sub_data)
+  
+  plot <- ggsurvplot(
+    km_fit,
+    data = sub_data,
+    pval = TRUE,
+    risk.table = FALSE,
+    conf.int = FALSE,
+    legend.title = "Risk group",
+    legend.labs = c("Low risk", "High risk"),
+    xlab = "Time (months)",
+    ylab = "Survival probability",
+    title = paste(cancer)
+  )
+  
+  km_by_cancer[[cancer]] <- list(
+    cancer = cancer,
+    top_genes = top_genes,
+    cox_model = cox_fit,
+    data = sub_data,
+    km_fit = km_fit,
+    plot = plot
+  )
+}
+
+#names(km_by_cancer)
+
+#lapply(km_by_cancer, function(x) print(x$plot))
+```
+
+```{r}
+plot_list <- lapply(km_by_cancer, function(x) x$plot$plot)
+
+combined_plot <- plot_grid(
+  plotlist = plot_list,
+  ncol = 3,
+  align = "hv",
+  labels = LETTERS[1:5]
+  #title = "Kaplan-Meier curves using cancer-type-specific top CNA features"
+)
+
+final_plot <- ggdraw() + 
+  draw_label(
+    "Kaplan-Meier curves using cancer-type-specific top CNA features",
+    x = 0.5, y = 0.98, hjust = 0.5, size = 25
+  ) + draw_plot(combined_plot, y = 0, height = 0.95)
+
+ggsave("./Figures/KM_combined_5cancers.png", final_plot, width = 14, height = 10, dpi = 300)
+```
+
+```{r}
+#| label: Cancer_type_specific_CNA_with_tumor_sites
+#| fig.width: 14
+#| fig.height: 10
+print(final_plot)
+```
+
+```{r}
+cancer_types_nosites <- unique(Analysis_static_full$CANCER_TYPE)
+
+km_by_cancer_nosites <- list()
+
+for (cancer in cancer_types_nosites) {
+  sub_data_nosites <- Analysis_static_full |>
+    filter(CANCER_TYPE == cancer) |>
+    filter(!is.na(OS_MONTHS), OS_MONTHS > 0, !is.na(OS_EVENT))
+  
+  gene_cols <- setdiff(colnames(sub_data_nosites), clinical_vars)
+  gene_cols <- gene_cols[gene_cols != ""]
+  
+  gene_freq <- sapply(sub_data_nosites[gene_cols], function(x) mean(x == 1, na.rm = TRUE))
+  
+  gene_freq <- gene_freq[gene_freq > 0]
+  
+  n_genes <- min(10, length(gene_freq))
+  top_genes <- names(sort(gene_freq, decreasing = TRUE))[1:n_genes]
+  
+  top_genes <- intersect(top_genes, colnames(sub_data_nosites))
+  
+  #cat("  Top genes:", paste(top_genes, collapse = ", "), "\n")
+  
+  cox_fit <- coxph(
+    as.formula(
+      paste(
+        "Surv(OS_MONTHS, OS_EVENT) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED +",
+        paste(top_genes, collapse = " + ")
+      )
+    ),
+    data = sub_data_nosites
+  )
+  
+  sub_data_nosites$risk_score <- predict(cox_fit, type = "lp")
+  cutoff <- median(sub_data_nosites$risk_score, na.rm = TRUE)
+  sub_data_nosites$risk_group <- factor(
+    ifelse(sub_data_nosites$risk_score > cutoff, "High risk", "Low risk"),
+    levels = c("Low risk", "High risk")
+  )
+  
+  km_fit <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ risk_group, data = sub_data_nosites)
+  
+  plot <- ggsurvplot(
+    km_fit,
+    data = sub_data_nosites,
+    pval = TRUE,
+    risk.table = FALSE,
+    conf.int = FALSE,
+    legend.title = "Risk group",
+    legend.labs = c("Low risk", "High risk"),
+    xlab = "Time (months)",
+    ylab = "Survival probability",
+    title = paste(cancer)
+  )
+  
+  km_by_cancer_nosites[[cancer]] <- list(
+    cancer = cancer,
+    top_genes = top_genes,
+    cox_model = cox_fit,
+    data = sub_data_nosites,
+    km_fit = km_fit,
+    plot = plot
+  )
+}
+
+#lapply(km_by_cancer_nosites, function(x) print(x$plot))
+```
+
+```{r}
+plot_list_nosites <- lapply(km_by_cancer_nosites, function(x) x$plot$plot)
+
+combined_plot_nosites <- plot_grid(
+  plotlist = plot_list_nosites,
+  ncol = 3,
+  align = "hv",
+  labels = LETTERS[1:5]
+  #title = "Kaplan-Meier curves using cancer-type-specific top CNA features"
+)
+
+final_plot_nosites <- ggdraw() + 
+  draw_label(
+    "Kaplan-Meier curves using cancer-type-specific top CNA features without tumor burden",
+    x = 0.5, y = 0.98, hjust = 0.5, size = 25
+  ) + draw_plot(combined_plot_nosites, y = 0, height = 0.95)
+
+ggsave("./Figures/KM_combined_5cancers_nosites.png", final_plot_nosites, width = 14, height = 10, dpi = 300)
+```
+
+```{r}
+#| label: Cancer_type_specific_CNA_without_tumor_sites
+#| fig.width: 14
+#| fig.height: 10
+print(final_plot_nosites)
+```
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
+
